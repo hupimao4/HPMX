@@ -7,7 +7,7 @@
 <link rel="manifest" href="./manifest.webmanifest">
 <meta name="theme-color" content="#14110D">
 <meta name="application-name" content="HPM 听书">
-<meta name="description" content="本地 TXT 转有声书 · 5 种少女音色 · 支持网址加载">
+<meta name="description" content="本地 TXT 转有声书 · 系统 TTS · 5 种少女音 · 支持网址加载">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="HPM 听书">
@@ -15,7 +15,6 @@
 <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png">
 <link rel="icon" type="image/png" sizes="512x512" href="./icon-512.png">
 <link rel="apple-touch-icon" sizes="192x192" href="./icon-192.png">
-<link rel="apple-touch-icon" sizes="512x512" href="./icon-512.png">
 <style>
 /* ============================================================
    HPM Design System · colors_and_type.css
@@ -457,7 +456,18 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
       return { ok: false, reason: 'too-large', byteCount: file.size };
     }
     try {
-      const buf   = await file.arrayBuffer();
+      // Use Blob.arrayBuffer if available; fall back to FileReader for old WebViews
+      let buf;
+      if (file.arrayBuffer) {
+        buf = await file.arrayBuffer();
+      } else {
+        buf = await new Promise((res, rej) => {
+          const r = new FileReader();
+          r.onload  = () => res(r.result);
+          r.onerror = () => rej(r.error || new Error("read failed"));
+          r.readAsArrayBuffer(file);
+        });
+      }
       const bytes = new Uint8Array(buf);
       const cs    = detect(bytes);
       const dec   = new TextDecoder(cs, { fatal: false });
@@ -465,7 +475,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
       text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\u0000/g, '');
       return { ok: true, text, charset: cs.toUpperCase(), byteCount: bytes.length };
     } catch (e) {
-      return { ok: false, reason: 'failed', error: String(e) };
+      return { ok: false, reason: 'failed', error: String(e && e.message || e) };
     }
   }
 
@@ -885,8 +895,36 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
  *     queue from the last known character index.
  */
 (function () {
-  const synth = window.speechSynthesis;
-  if (!synth) { window.HpmTts = { unsupported: true }; return; }
+  // ─── Native TTS bridges (preferred when running inside an APK) ─────────
+  // Order: Capacitor plugin → median.co bridge → window.speechSynthesis.
+  const cap = window.Capacitor;
+  const capTts = cap && cap.Plugins && cap.Plugins.TextToSpeech;
+
+  // median.co exposes window.median or window.gonative depending on version.
+  // The TTS feature ships under the "Text to Speech" add-on; if enabled, the
+  // bridge function below is reachable.
+  const median = window.median || window.gonative;
+  const medianTts = median && (median.tts || (median.run && {
+    speak: (o) => median.run({ command: "tts.speak", data: o }),
+    stop:  ()  => median.run({ command: "tts.stop" }),
+  }));
+
+  const NATIVE = !!capTts;
+  const MEDIAN = !NATIVE && !!medianTts;
+  const synth = (NATIVE || MEDIAN) ? null : window.speechSynthesis;
+
+  if (!NATIVE && !MEDIAN && !synth) {
+    // Even without TTS we still want HpmTts to exist so the UI doesn't crash.
+    // We expose a `unsupported: true` stub; the app's UI shows a clear error.
+    window.HpmTts = {
+      unsupported: true,
+      onState: (fn) => { fn({ ready: false, playing: false, paused: false }); return () => {}; },
+      speak: () => {}, pause: () => {}, resume: () => {}, stop: () => {}, setRate: () => {},
+      voices: () => [], ready: () => Promise.resolve([]),
+      state: { ready: false, playing: false, paused: false },
+    };
+    return;
+  }
 
   const listeners = new Set();
   let state = {
@@ -896,10 +934,16 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
   };
   const emit = () => { for (const fn of listeners) { try { fn(state); } catch (_) {} } };
 
-  // ---- Voice readiness ----
+  // ─── Voice readiness ────
   let readyResolve;
   const readyP = new Promise(r => { readyResolve = r; });
   function refreshVoices() {
+    if (NATIVE) {
+      // Native is ready as soon as plugin is reachable
+      state = { ...state, ready: true };
+      readyResolve([]); emit();
+      return;
+    }
     const vs = synth.getVoices();
     if (vs.length && !state.ready) {
       state = { ...state, ready: true };
@@ -907,7 +951,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
     }
   }
   refreshVoices();
-  synth.onvoiceschanged = refreshVoices;
+  if (!NATIVE) synth.onvoiceschanged = refreshVoices;
 
   // ---- Chunking ----
   const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent || "");
@@ -1101,6 +1145,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
   }
   // Re-grab wake lock + kick the engine if it stalled while the page was hidden
   document.addEventListener("visibilitychange", () => {
+    if (NATIVE) return;
     if (document.visibilityState === "visible" && session && !state.paused) {
       acquireWakeLock();
       if (!synth.speaking && !synth.pending) {
@@ -1110,6 +1155,8 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
   });
 
   function speak(text, opts = {}) {
+    if (NATIVE) return nativeSpeak(text, opts);
+    if (MEDIAN) return medianSpeak(text, opts);
     stop();
     if (!text || !text.trim()) return;
     const lang = opts.lang || detectLang(text);
@@ -1133,12 +1180,16 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
   }
 
   function pause() {
+    if (NATIVE) return nativePause();
+    if (MEDIAN) return medianPause();
     if (!session) return;
     try { synth.pause(); } catch (_) {}
     state = { ...state, playing: false, paused: true };
     emit();
   }
   function resume() {
+    if (NATIVE) return nativeResume();
+    if (MEDIAN) return medianResume();
     if (state.paused && session) {
       try { synth.resume(); } catch (_) {}
       // Some browsers don't actually resume after a long pause — if not
@@ -1157,6 +1208,8 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
     // the simple resume here.
   }
   function stop() {
+    if (NATIVE) return nativeStop();
+    if (MEDIAN) return medianStop();
     session = null;
     clearTimers();
     releaseWakeLock();
@@ -1164,6 +1217,146 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
     state = { ...state, playing: false, paused: false };
     emit();
   }
+  // ─── Native Android TTS path (Capacitor + @capacitor-community/text-to-speech) ──
+  // Speaks one chunk at a time, watching for completion via the plugin's
+  // promise resolution. Uses an estimator for char-progress (the plugin
+  // doesn't fire word boundaries on Android).
+  let nativeSession = null;
+  async function nativeSpeak(text, opts = {}) {
+    nativeStop();
+    if (!text || !text.trim()) return;
+    const rate  = clampRate(opts.rate || state.rate || 1.0);
+    const pitch = opts.pitch == null ? 1.0 : opts.pitch;
+    const lang  = opts.lang || "zh-CN";
+    const chunks = chunkText(text, 200);
+    nativeSession = { chunks, idx: 0, lang, rate, pitch, opts, cancelled: false };
+    state = {
+      ...state, rate, pitch, voice: { name: "native-" + lang, lang },
+      totalChars: text.length, charIndex: opts.baseChar || 0,
+      playing: true, paused: false,
+    };
+    emit();
+    acquireWakeLock();
+    await nativeSpeakNext();
+  }
+  async function nativeSpeakNext() {
+    if (!nativeSession || nativeSession.cancelled) return;
+    const s = nativeSession;
+    if (s.idx >= s.chunks.length) { finishNative(); return; }
+    const text = s.chunks[s.idx];
+    try {
+      await capTts.speak({
+        text, lang: s.lang, rate: s.rate, pitch: s.pitch, volume: 1.0,
+        category: "playback",
+      });
+    } catch (e) {
+      if (e && /interrupt|cancel/i.test(String(e.message || ""))) return;
+    }
+    if (!nativeSession || nativeSession.cancelled) return;
+    // Advance char counter to the start of next chunk
+    const startOfNext = chunkOffset(s.chunks, s.idx + 1);
+    state = { ...state, charIndex: (s.opts.baseChar || 0) + startOfNext };
+    emit();
+    s.idx++;
+    setTimeout(nativeSpeakNext, 30);
+  }
+  async function nativePause() {
+    if (!nativeSession) return;
+    try { await capTts.stop(); } catch (_) {}
+    state = { ...state, playing: false, paused: true };
+    emit();
+  }
+  async function nativeResume() {
+    if (!nativeSession || !state.paused) return;
+    state = { ...state, playing: true, paused: false };
+    emit();
+    nativeSpeakNext();
+  }
+  async function nativeStop() {
+    if (nativeSession) nativeSession.cancelled = true;
+    nativeSession = null;
+    try { if (capTts) await capTts.stop(); } catch (_) {}
+    releaseWakeLock();
+    state = { ...state, playing: false, paused: false };
+    emit();
+  }
+  function finishNative() {
+    nativeSession = null;
+    releaseWakeLock();
+    state = { ...state, playing: false, paused: false };
+    emit();
+  }
+
+  // ─── median.co bridge path ─────────────────────────────────────────────
+  // median.co's TTS add-on exposes `median.tts.speak({text, lang, rate, pitch})`
+  // and `median.tts.stop()`. It doesn't fire completion events reliably, so
+  // we chunk and re-call after a time-based estimate.
+  let medianSession = null;
+  let medianTimer = null;
+  async function medianSpeak(text, opts = {}) {
+    medianStop();
+    if (!text || !text.trim()) return;
+    const rate  = clampRate(opts.rate || state.rate || 1.0);
+    const pitch = opts.pitch == null ? 1.0 : opts.pitch;
+    const lang  = opts.lang || "zh-CN";
+    const chunks = chunkText(text, 180);
+    medianSession = { chunks, idx: 0, lang, rate, pitch, opts, cancelled: false };
+    state = {
+      ...state, rate, pitch, voice: { name: "median-" + lang, lang },
+      totalChars: text.length, charIndex: opts.baseChar || 0,
+      playing: true, paused: false,
+    };
+    emit();
+    medianSpeakNext();
+  }
+  async function medianSpeakNext() {
+    if (!medianSession || medianSession.cancelled) return;
+    const s = medianSession;
+    if (s.idx >= s.chunks.length) { finishMedian(); return; }
+    const text = s.chunks[s.idx];
+    try {
+      await medianTts.speak({ text, lang: s.lang, rate: s.rate, pitch: s.pitch });
+    } catch (_) {}
+    if (!medianSession || medianSession.cancelled) return;
+    // Time-based completion estimate (~5 chars/sec at 1.0× Chinese)
+    const estMs = Math.max(800, (text.length / (5 * s.rate)) * 1000 + 200);
+    if (medianTimer) clearTimeout(medianTimer);
+    medianTimer = setTimeout(() => {
+      if (!medianSession || medianSession.cancelled) return;
+      const startOfNext = chunkOffset(s.chunks, s.idx + 1);
+      state = { ...state, charIndex: (s.opts.baseChar || 0) + startOfNext };
+      emit();
+      s.idx++;
+      medianSpeakNext();
+    }, estMs);
+  }
+  async function medianPause() {
+    if (!medianSession) return;
+    try { await medianTts.stop(); } catch (_) {}
+    if (medianTimer) { clearTimeout(medianTimer); medianTimer = null; }
+    state = { ...state, playing: false, paused: true };
+    emit();
+  }
+  async function medianResume() {
+    if (!medianSession || !state.paused) return;
+    state = { ...state, playing: true, paused: false };
+    emit();
+    medianSpeakNext();
+  }
+  async function medianStop() {
+    if (medianSession) medianSession.cancelled = true;
+    medianSession = null;
+    if (medianTimer) { clearTimeout(medianTimer); medianTimer = null; }
+    try { if (medianTts) await medianTts.stop(); } catch (_) {}
+    state = { ...state, playing: false, paused: false };
+    emit();
+  }
+  function finishMedian() {
+    medianSession = null;
+    state = { ...state, playing: false, paused: false };
+    emit();
+  }
+
   function setRate(r) {
     state = { ...state, rate: clampRate(r) };
     emit();
@@ -1172,12 +1365,15 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); -
   }
   function clampRate(r) { return Math.min(3.0, Math.max(0.5, Number(r) || 1.0)); }
 
-  function voices() { return synth.getVoices(); }
+  function voices() { return synth ? synth.getVoices() : []; }
   function onState(fn) { listeners.add(fn); fn(state); return () => listeners.delete(fn); }
-  function ready() { return state.ready ? Promise.resolve(synth.getVoices()) : readyP; }
+  function ready() { return state.ready ? Promise.resolve(voices()) : readyP; }
 
   window.HpmTts = {
     unsupported: false,
+    native: NATIVE,
+    median: MEDIAN,
+    engine: NATIVE ? "capacitor" : (MEDIAN ? "median" : "web"),
     speak, pause, resume, stop, setRate,
     voices, onState, ready,
     detectLang, pickVoice,
@@ -2200,34 +2396,51 @@ const VoicesScreen = ({ voices, currentVoice, onPick, onBack, onDownload }) => {
 // ============================================================================
 const AddFileSheet = ({ onClose, onAdd }) => {
   const inputRef = React.useRef(null);
+  const [tab, setTab] = React.useState("local");
   const [reading, setReading] = React.useState(false);
   const [error,   setError]   = React.useState(null);
   const [progress, setProgress] = React.useState(null);
   const [dragOver, setDragOver] = React.useState(false);
+  const [urlInput, setUrlInput] = React.useState("");
+  const [urlHistory, setUrlHistory] = React.useState(() =>
+    (window.HpmStore && window.HpmStore.get("urlHistory", [])) || []);
+
+  const formatSize = (n) =>
+    (window.HpmReadTextFile && window.HpmReadTextFile.formatSize)
+      ? window.HpmReadTextFile.formatSize(n)
+      : ((n / 1024 / 1024).toFixed(1) + " MB");
 
   const handleFiles = async (fileList) => {
     if (!fileList || !fileList.length) return;
     setReading(true); setError(null); setProgress(null);
-    for (const file of Array.from(fileList)) {
-      if (!/\.txt$/i.test(file.name) && file.type && !file.type.startsWith("text/")) {
-        setError(`仅支持 TXT · ${file.name}`); continue;
+    try {
+      for (const file of Array.from(fileList)) {
+        if (!/\.txt$/i.test(file.name) && file.type && !file.type.startsWith("text/")) {
+          setError(`仅支持 TXT · ${file.name}`); continue;
+        }
+        if (!window.HpmReadTextFile) { setError("读取器未初始化"); continue; }
+        setProgress({ name: file.name, stage: "读取中" });
+        const r = await window.HpmReadTextFile(file);
+        if (r && r.ok) {
+          setProgress({ name: file.name, stage: "添加中" });
+          try {
+            await Promise.resolve(onAdd({
+              name: file.name,
+              size: formatSize(r.byteCount),
+              text: r.text,
+              charset: r.charset,
+            }));
+          } catch (e) { setError("加入书架失败 · " + (e && e.message || e)); }
+        } else if (r && r.reason === "too-large") {
+          setError(`文件过大 · ${formatSize(r.byteCount || 0)} · 上限 64 MB`);
+        } else if (r && r.reason === "empty") setError("文件为空");
+        else setError("无法读取文件 · " + ((r && r.error) || "未知错误"));
       }
-      setProgress({ name: file.name, stage: "读取中" });
-      const r = await window.HpmReadTextFile(file);
-      if (r.ok) {
-        setProgress({ name: file.name, stage: "添加中" });
-        onAdd({
-          name: file.name,
-          size: window.HpmReadTextFile.formatSize(r.byteCount),
-          text: r.text,
-          charset: r.charset,
-        });
-      } else if (r.reason === "too-large") {
-        setError(`文件过大 · ${window.HpmReadTextFile.formatSize(r.byteCount)} · 上限 64 MB`);
-      } else if (r.reason === "empty") setError("文件为空");
-      else setError("无法读取文件 · " + (r.error || ""));
+    } catch (e) {
+      setError("读取失败 · " + (e && e.message || e));
+    } finally {
+      setReading(false); setProgress(null);
     }
-    setReading(false); setProgress(null);
   };
 
   const handleUrl = async (rawUrl) => {
@@ -2238,17 +2451,18 @@ const AddFileSheet = ({ onClose, onAdd }) => {
     setProgress({ name: url.length > 50 ? url.slice(0, 50) + "…" : url, stage: "下载中" });
     const r = await window.HpmFetchUrl(url);
     setReading(false); setProgress(null);
-    if (r.ok) {
-      onAdd({ name: r.name || "remote.txt",
-              size: window.HpmReadTextFile.formatSize(r.byteCount),
-              text: r.text, charset: r.charset });
-      // Save URL history (top 8)
+    if (r && r.ok) {
+      try {
+        await Promise.resolve(onAdd({ name: r.name || "remote.txt",
+                size: formatSize(r.byteCount),
+                text: r.text, charset: r.charset }));
+      } catch (e) { setError("加入书架失败 · " + (e && e.message || e)); return; }
       const next = [url, ...urlHistory.filter(u => u !== url)].slice(0, 8);
       setUrlHistory(next);
       if (window.HpmStore) window.HpmStore.set("urlHistory", next);
-    } else if (r.reason === "too-large") {
-      setError(`文件过大 · ${window.HpmReadTextFile.formatSize(r.byteCount)} · 上限 64 MB`);
-    } else if (r.reason === "cors") {
+    } else if (r && r.reason === "too-large") {
+      setError(`文件过大 · ${formatSize(r.byteCount || 0)} · 上限 64 MB`);
+    } else if (r && r.reason === "cors") {
       setError("无法访问该网址 · 跨域被拦截或网址不公开");
     } else {
       setError("加载失败 · " + (r.error || r.reason));
@@ -2856,18 +3070,39 @@ function App() {
 
   const handleAdd = async (file) => {
     setShowAdd(false);
-    const id = (file.name || "untitled").replace(/\.txt$/i, "");
+    const safeName = (file.name || "untitled").replace(/[\\/:*?"<>|]/g, "_");
+    const id = safeName.replace(/\.txt$/i, "") || "book-" + Date.now();
     const text = file.text || "";
-    // Save TEXT in IndexedDB (handles 12 MB+ without freezing)
-    if (window.HpmDB) await window.HpmDB.setText(id, text);
-    // Save META in localStorage (small)
+
+    try {
+      // 1) Save text to IndexedDB FIRST (independently of React state)
+      if (window.HpmDB) {
+        await window.HpmDB.setText(id, text);
+      }
+    } catch (e) {
+      console.error("save to IndexedDB failed", e);
+      alert("保存到本地失败 · " + (e && e.message ? e.message : "未知错误"));
+      return;
+    }
+
+    // 2) Build meta (small, safe for localStorage)
     const newMeta = {
-      id, title: id, author: "本地", palette: "paper",
+      id, title: id.length > 60 ? id.slice(0, 60) + "…" : id,
+      author: "本地", palette: "paper",
       progress: 0, size: file.size, chapter: "—",
       charset: file.charset || null,
     };
-    if (!meta.find(b => b.id === id)) setMeta([newMeta, ...meta]);
-    if (!ttsUnsupported) tts.stop();
+
+    // 3) Update meta list defensively
+    try {
+      const without = (meta || []).filter(b => b.id !== id);
+      setMeta([newMeta, ...without]);
+    } catch (e) {
+      console.error("setMeta failed", e);
+    }
+
+    // 4) Switch to the new book — clear any in-flight TTS first
+    try { if (!ttsUnsupported && tts) tts.stop(); } catch (_) {}
     setCurrentId(id);
     setSeekBase(0);
     setRoute("playing");
